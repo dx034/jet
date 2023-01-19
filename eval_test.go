@@ -83,11 +83,21 @@ func init() {
 	}
 
 	JetTestingSet.AddGlobal("dummy", dummy)
+	JetTestingSet.AddGlobalFunc("customFn", func(args Arguments) reflect.Value {
+		args.RequireNumOfArguments("customFn", 1, 1)
+		return args.Get(0)
+	})
+
 	JetTestingLoader.Set("actionNode_dummy", `hello {{dummy("WORLD")}}`)
 	JetTestingLoader.Set("noAllocFn", `hello {{ "José" }} {{1}} {{ "José" }}`)
 	JetTestingLoader.Set("rangeOverUsers", `{{range .}}{{.Name}}-{{.Email}}{{end}}`)
 	JetTestingLoader.Set("rangeOverUsers_Set", `{{range index,user:= . }}{{index}}{{user.Name}}-{{user.Email}}{{end}}`)
 	JetTestingLoader.Set("BenchNewBlock", "{{ block col(md=12,offset=0) }}\n<div class=\"col-md-{{md}} col-md-offset-{{offset}}\">{{ yield content }}</div>\n\t\t{{ end }}\n\t\t{{ block row(md=12) }}\n<div class=\"row {{md}}\">{{ yield content }}</div>\n\t\t{{ content }}\n<div class=\"col-md-1\"></div>\n<div class=\"col-md-1\"></div>\n<div class=\"col-md-1\"></div>\n\t\t{{ end }}\n\t\t{{ block header() }}\n<div class=\"header\">\n\t{{ yield row() content}}\n\t\t{{ yield col(md=6) content }}\n{{ yield content }}\n\t\t{{end}}\n\t{{end}}\n</div>\n\t\t{{content}}\n<h1>Hey</h1>\n\t\t{{ end }}")
+	JetTestingLoader.Set("BenchCustomRanger", "{{range .}}{{.Name}}{{end}}")
+	JetTestingLoader.Set("BenchIntsRanger", "{{range ints(0, .)}} {{end}}")
+	JetTestingLoader.Set("BenchCustomRender", "{{range k, v := ints(0, .N)}}{{.Field}}{{end}}")
+	JetTestingLoader.Set("BenchCallCustomFn", "{{range ints(0, .N)}}{{customFn(.)}}{{end}}")
+	JetTestingLoader.Set("BenchExecPipeline", "{{range ints(0, .N)}}{{. | customFn}}{{end}}")
 }
 
 func RunJetTest(t *testing.T, variables VarMap, context interface{}, testName, testContent, testExpected string) {
@@ -684,6 +694,35 @@ func TestBuiltinCollectionFuncs(t *testing.T) {
 	RunJetTest(t, nil, nil, "array_builtin", `{{ m := array( "foo", "bar", "asd", 123)}}{{m}}`, "[foo bar asd 123]")
 }
 
+// customTestRanger satisfies the Ranger interface for custom tests.
+type customTestRanger struct {
+	providesIndex bool
+	data          []string
+	i             int
+}
+
+var _ Ranger = (*customTestRanger)(nil)
+
+func (ctr *customTestRanger) ProvidesIndex() bool {
+	return ctr.providesIndex
+}
+
+func (ctr *customTestRanger) Range() (k reflect.Value, v reflect.Value, done bool) {
+	if ctr.i >= len(ctr.data) {
+		// Reset ctr.i for the next test.
+		ctr.i = 0
+		done = true
+		return
+	}
+
+	if ctr.providesIndex {
+		k = reflect.ValueOf(ctr.i)
+	}
+	v = reflect.ValueOf(ctr.data[ctr.i])
+	ctr.i += 1
+	return
+}
+
 func TestRanger(t *testing.T) {
 	c := make(chan string)
 	go func() {
@@ -702,15 +741,29 @@ func TestRanger(t *testing.T) {
 	)
 	data.Set("s", []string{"asd", "foo", "bar"})
 	data.Set("c", c)
+	data.Set("ci", &customTestRanger{
+		providesIndex: true,
+		data:          []string{"asd", "foo", "bar"},
+	})
+	data.Set("cu", &customTestRanger{
+		providesIndex: false,
+		data:          []string{"asd", "foo", "bar"},
+	})
 	RunJetTest(t, data, nil, "slice_ranger", `{{ range s }}{{.}},{{ end }}`, "asd,foo,bar,")
-	RunJetTest(t, data, nil, "slice_ranger_value", `{{ range v := s }}{{v}},{{ end }}`, "0,1,2,")
-	RunJetTest(t, data, nil, "slice_ranger_value_context", `{{ range v := s }}{{.}},{{ end }}`, "asd,foo,bar,")
+	RunJetTest(t, data, nil, "slice_ranger_index", `{{ range k := s }}{{k}},{{ end }}`, "0,1,2,")
+	RunJetTest(t, data, nil, "slice_ranger_index_context", `{{ range k := s }}{{k}}:{{.}},{{ end }}`, "0:asd,1:foo,2:bar,")
 	RunJetTest(t, data, nil, "slice_ranger_index_value", `{{ range i, v := s }}{{i}}:{{v}},{{ end }}`, "0:asd,1:foo,2:bar,")
 	RunJetTest(t, data, nil, "map_ranger", `{{ range m }}{{.}},{{ end }}`, "123,")
 	RunJetTest(t, data, nil, "map_ranger_key_context", `{{ range k := m }}{{k}}:{{.}},{{ end }}`, "asd:123,")
 	RunJetTest(t, data, nil, "map_ranger_key_value", `{{ range k, v := m }}{{k}}:{{v}},{{ end }}`, "asd:123,")
 	RunJetTest(t, data, nil, "chan_ranger", `{{ range v := c }}{{v}}{{ end }}`, "0123456789")
 	RunJetTest(t, nil, nil, "ints_ranger", `{{ range i := ints(0, 10) }}{{ (i == 0 ? "" : ", ") + i }}{{ end }}`, "0, 1, 2, 3, 4, 5, 6, 7, 8, 9")
+	RunJetTest(t, nil, nil, "ints_ranger_index_value", `{{ range k, v := ints(10, 20) }}{{k}}:{{v}} {{ end }}`, "0:10 1:11 2:12 3:13 4:14 5:15 6:16 7:17 8:18 9:19 ")
+	RunJetTest(t, data, nil, "custom_indexed_ranger", `{{ range ci }}{{.}},{{ end  }}`, "asd,foo,bar,")
+	RunJetTest(t, data, nil, "custom_indexed_ranger_key_context", `{{ range k := ci }}{{k}}:{{.}},{{ end  }}`, "0:asd,1:foo,2:bar,")
+	RunJetTest(t, data, nil, "custom_indexed_ranger_key_value", `{{ range k, v := ci }}{{k}}:{{v}},{{ end  }}`, "0:asd,1:foo,2:bar,")
+	RunJetTest(t, data, nil, "custom_unindexed_ranger", `{{ range cu }}{{.}},{{ end  }}`, "asd,foo,bar,")
+	RunJetTest(t, data, nil, "custom_unindexed_ranger_value", `{{ range v := cu }}{{v}},{{ end  }}`, "asd,foo,bar,")
 }
 
 func TestWhitespaceControl(t *testing.T) {
@@ -842,5 +895,153 @@ func BenchmarkJetFunc(b *testing.B) {
 		if err != nil {
 			b.Error(err.Error())
 		}
+	}
+}
+
+// customBenchRanger satisfies the Ranger interface for custom benchmarks.
+type customBenchRanger struct {
+	i, n int
+	key  reflect.Value
+	data reflect.Value
+}
+
+var _ Ranger = (*customBenchRanger)(nil)
+
+func (cbr *customBenchRanger) ProvidesIndex() bool {
+	return false
+}
+
+func (cbr *customBenchRanger) Range() (_ reflect.Value, v reflect.Value, done bool) {
+	if cbr.i >= cbr.n {
+		done = true
+		return
+	}
+
+	v = cbr.data
+	cbr.i += 1
+	return
+}
+
+// BenchmarkCustomRanger benchmarks the overhead in doing one iteration of
+// a custom ranger.
+func BenchmarkCustomRanger(b *testing.B) {
+	data := reflect.ValueOf(struct {
+		Name string
+	}{Name: "John Doe"})
+	execCtx := &customBenchRanger{data: data, n: b.N}
+
+	t, _ := JetTestingSet.GetTemplate("BenchCustomRanger")
+	b.ResetTimer()
+	err := t.Execute(ww, nil, execCtx)
+	if err != nil {
+		b.Error(err.Error())
+	}
+}
+
+// BenchmarkIntsRanger benchmarks the performance of doing one additional
+// iteration using the ints ranger.
+func BenchmarkIntsRanger(b *testing.B) {
+	t, _ := JetTestingSet.GetTemplate("BenchIntsRanger")
+	b.ResetTimer()
+	err := t.Execute(ww, nil, b.N)
+	if err != nil {
+		b.Error(err.Error())
+	}
+}
+
+type customRenderer struct {
+	data []byte
+}
+
+func (cr *customRenderer) Render(r *Runtime) {
+	r.Write(cr.data)
+}
+
+var _ Renderer = (*customRenderer)(nil)
+
+// BenchmarkCustomRender benchmarks executing a template that calls the Render()
+// method of a custom renderer object.
+func BenchmarkCustomRender(b *testing.B) {
+	execCtx := struct {
+		N     int
+		Field *customRenderer
+	}{
+		N:     b.N,
+		Field: &customRenderer{data: []byte("foobar")},
+	}
+	t, _ := JetTestingSet.GetTemplate("BenchCustomRender")
+	b.ResetTimer()
+	err := t.Execute(ww, nil, execCtx)
+	if err != nil {
+		b.Error(err.Error())
+	}
+}
+
+// BenchmarkCallCustomFn benchmarks executing a template that calls a custom
+// function repeatedly.
+func BenchmarkCallCustomFn(b *testing.B) {
+	t, _ := JetTestingSet.GetTemplate("BenchCallCustomFn")
+	execCtx := struct{ N int }{N: b.N}
+	b.ResetTimer()
+	err := t.Execute(ww, nil, execCtx)
+	if err != nil {
+		b.Error(err.Error())
+	}
+
+}
+
+// BenchmarkExecPipeline benchmarks executing a template that calls a pipeline
+// repeatedly.
+func BenchmarkExecPipeline(b *testing.B) {
+	t, _ := JetTestingSet.GetTemplate("BenchExecPipeline")
+	execCtx := struct{ N int }{N: b.N}
+	b.ResetTimer()
+	err := t.Execute(ww, nil, execCtx)
+	if err != nil {
+		b.Error(err.Error())
+	}
+
+}
+
+// BenchmarkFieldAccess benchmarks executing a template that accesses fields
+// in the current context.
+//
+// This measures the overhead from adding one additional field access to a
+// template.
+func BenchmarkFieldAccess(b *testing.B) {
+	// This benchmark is disabled from normal execution due to being
+	// limited by the parsing performance of this package. When the
+	// benchmark len grows greater than about 100K, parsing performance is
+	// degraded and this benchmark takes a long time to setup.
+	//
+	// To test this, comment out the following line and run this specific
+	// benchmark with
+	//   go test -run Bench -bench BenchmarkFieldAcces -benchtime 0.02s
+	b.Skip("Can only run manually with -benchtime 0.02s")
+
+	const numFields = 3 // Must match the structure below.
+	tmplBuilder := new(strings.Builder)
+	for i := 0; i < b.N; i++ {
+		fmt.Fprintf(tmplBuilder, "{{ .Field%d }} ", i%numFields+1)
+	}
+
+	loader := NewInMemLoader()
+	loader.Set("BenchFields", tmplBuilder.String())
+	set := NewSet(loader, WithSafeWriter(nil))
+	testCtx := struct {
+		Field1 string
+		Field2 int
+		Field3 float64
+	}{
+		Field1: "secret",
+		Field2: 42,
+		Field3: 3.1415,
+	}
+	t, _ := set.GetTemplate("BenchFields")
+
+	b.ResetTimer()
+	err := t.Execute(ww, nil, testCtx)
+	if err != nil {
+		b.Error(err.Error())
 	}
 }
